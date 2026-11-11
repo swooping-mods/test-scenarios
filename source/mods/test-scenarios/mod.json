@@ -1,0 +1,34 @@
+{
+  "id": "test-scenarios",
+  "kind": "native",
+  "version": "0.1.0",
+  "display_name": "Fast Test Scenarios",
+  "feature_dependencies": [
+    "test-framework",
+    "shop-framework",
+    "equipment-framework"
+  ],
+  "gameplay": true,
+  "requires_apis": [
+    {
+      "api": "test-framework.testing",
+      "abi": 1,
+      "min_size": 24
+    },
+    {
+      "api": "test-framework.isolation",
+      "abi": 1,
+      "min_size": 24
+    },
+    {
+      "api": "shop-framework.shop",
+      "abi": 1,
+      "min_size": 56
+    },
+    {
+      "api": "equipment-framework.equipment",
+      "abi": 1,
+      "min_size": 32
+    }
+  ]
+}
