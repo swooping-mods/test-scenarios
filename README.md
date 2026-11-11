@@ -1,5 +1,7 @@
 # Fast Test Scenarios
 
+<img src="media/icon.png" alt="Fast Test Scenarios icon" width="128" height="128">
+
 Private scenario automation; explicit testing launcher only.
 
 ## Install
