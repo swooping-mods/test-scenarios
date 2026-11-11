@@ -6,7 +6,9 @@ Private scenario automation; explicit testing launcher only.
 
 Install [Moon Sweepers Mod Loader](https://github.com/swooping-mods/moon-sweepers-mod-loader) first.
 
-Download [test-scenarios-0.1.0.msmod](content/test-scenarios-0.1.0.msmod), import it with **Install mod package**, then select the mod and its required frameworks.
+Download [test-scenarios-0.1.0.msmod](content/test-scenarios-0.1.0.msmod), then drag and drop the `.msmod` file onto the [Moon Sweepers Mod Loader](https://github.com/swooping-mods/moon-sweepers-mod-loader) window. You can also use **Add mods…** (older loader builds: **Install mod package**).
+
+Select the mod and its required frameworks, click **Prepare files**, then **Launch**.
 
 Required mods: [test-framework](https://github.com/swooping-mods/test-framework), [shop-framework](https://github.com/swooping-mods/shop-framework), [equipment-framework](https://github.com/swooping-mods/equipment-framework).
 
