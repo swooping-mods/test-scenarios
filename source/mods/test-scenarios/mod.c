@@ -2,6 +2,7 @@
 #include "../../runtime/native/gameplay.h"
 #include "../../runtime/sdk/native_adapters/reflection.h"
 #include "../../runtime/native/services.h"
+#include "../../runtime/sdk/camera.h"
 #include "../test-framework/sdk/testing.h"
 #include "../shop-framework/sdk.h"
 #include "../equipment-framework/sdk/equipment.h"
@@ -10,15 +11,19 @@ static const MoonTesting *ts;
 static const MoonTestIsolation *isolation;
 static const MoonShop *shop;
 static const MoonEquipment *equipment;
+static const MoonCameraApiV1 *s_camera_api;
+static const char *s_camera_owner="test-scenarios.camera";
+__declspec(dllexport) int MoonLab_CameraApiAbi(void){return MOON_CAMERA_ABI;}
 static PTR s_alive, s_player, s_wallet, s_decimal_int, s_to_int, s_set_money, s_charge;
 static PTR s_component, s_shop_open, s_shop_is_open, s_loadout, s_selected, s_assign, s_select;
 static PTR s_clear_slot,s_equip_prototype;
 static PTR s_fov,s_set_fov;
 static PTR s_firstperson,s_menu_blocked,s_typing;
+static PTR s_map_is_open,s_map_close;
 static PTR s_tree_level,s_tree_max,s_tree_requirements,s_tree_missing,s_tree_buy,s_tree_owned,s_tree_total,s_boots;
 static PTR s_tool_level,s_tool_buy,s_tool_id;
 static PTR s_sends_achievements;
-static void (*s_class_init)(PTR),(*s_static_get)(PTR,void *);
+static void (*s_static_get)(PTR,void *);
 static void (*s_key_event)(unsigned char,unsigned char,DWORD,U64);
 static short (*s_key_state)(int);
 static PTR (*s_foreground)(void);
@@ -40,7 +45,14 @@ static void s_note_string(const char *event,PTR value) {
     for(int i=0;i<length;i++)text[i]=chars[i]>=32&&chars[i]<127?(char)chars[i]:'?';
     text[length]=0;s_note(event,text);
 }
+#include "calls.h"
+#include "capsule_state.h"
+#include "save_state.h"
 typedef struct {
+    CFixture capsule;
+    STask save;
+    int capsule_checkpoint,reload_next;
+    int capsule_failure,capsule_stop,capsule_full,capsule_full_done;unsigned long long capsule_retry_ms;
     DRoot world, walker, player, menu, previous_tool,previous_prototype,camera;
     int original_money, original_slot, original_belt_slot, test_slot, stage, owns_wallet, owns_slot, menu_was_open;
     unsigned long long frame;
@@ -49,13 +61,32 @@ typedef struct {
     int expected_price, equip;
     unsigned long long action_ms;
     float original_fov;
-    int key_held;
-    DRoot nodes,gear,tools;
+    int key_held,zoom_mode;
+    unsigned camera_token;
+    DRoot nodes,gear,tools,map;
+    int owns_map,map_was_open;
     unsigned fixture_index,fixture_round,fixture_progress;
+    DRoot scene_camera,scene_target,scene_transform,scene_first,scene_last,scene_previous,scene_atlas,scene_model;
+    DVec scene_center,scene_first_position;
+    unsigned sticker_count,sticker_action;
+    int sticker_design,scene_complete;
+    DRoot native_inventory,native_container_id;double native_capacity;
 } TSState;
 static TSState context_state, wallet_state, catalog_state;
 static TSState zoom_state={.key="zoom-module"};
+static TSState zoom_menu_state={.key="zoom-module",.zoom_mode=1};
+static TSState zoom_unequip_state={.key="zoom-module",.zoom_mode=2};
+static TSState zoom_camera_state={.key="zoom-module",.zoom_mode=3};
 static TSState progression_state;
+static TSState map_state={.key="portable-map"};
+static TSState sticker_state={.key="sticker-label-gun"};
+static TSState sticker_capacity_state={.key="sticker-label-gun"};
+static TSState vacuum_container_state={.key="handheld-vacuum"};
+static TSState vacuum_capsule_state={.key="handheld-vacuum"};
+static TSState vacuum_collect_state={.key="handheld-vacuum"};
+static TSState vacuum_full_state={.key="handheld-vacuum",.capsule_full=1};
+static TSState vacuum_checkpoint_state={.key="handheld-vacuum",.capsule_checkpoint=1};
+static TSState vacuum_reopen_state={.key="handheld-vacuum"};
 static TSState locked_states[]={{.key="building-drone"},{.key="joonas-backpack"}};
 static TSState tool_states[] = {
     {.key="zoom-module", .expected_price=125, .equip=1},
@@ -69,6 +100,7 @@ static TSState tool_states[] = {
     {.key="building-drone", .expected_price=2000, .equip=1},
     {.key="joonas-backpack", .expected_price=5000, .equip=1},
 };
+#include "input.h"
 static int s_live(PTR object) {
     int ok=1; void *args[]={object}; PTR value=object?call(s_alive,0,args,&ok):0;
     return ok&&value&&*(unsigned char *)unbox(value);
@@ -116,26 +148,71 @@ static int s_restore_slot(TSState *state) {
     void *args[]={dget(state->player),&state->test_slot};PTR actual=call(s_loadout,dget(state->world),args,&ok);
     return ok&&s_same_string(previous,actual);
 }
-static int s_capture(const MoonTestContext *context,void *user,const char **reason) {
+static int s_restore_equipment(TSState *state) {
+    int ok=s_restore_slot(state);
+    PTR belt=s_get_component(dget(state->walker),"MoonToolbelt",&ok);
+    if(!belt)return 0;
+    if(state->original_belt_slot<0){void *args[]={dget(state->previous_prototype)};call(s_equip_prototype,belt,args,&ok);}
+    else {void *args[]={&state->original_belt_slot};call(s_select,belt,args,&ok);}
+    return ok;
+}
+static PTR s_native_shop(const MoonTestContext *context,int *ok) {
+    PTR menu=s_get_component(context->walker,"MoonUpgradeShop",ok);
+    if(!menu&&*ok) {
+        PTR camera=0,field=get_field(object_class(context->walker),"viewCamera");
+        if(field)field_value(context->walker,field,&camera);
+        void *args[]={camera};if(camera)menu=call(s_shop_camera,0,args,ok);
+    }
+    return menu;
+}
+#include "scene.h"
+#include "capsule_fixture.h"
+#include "capsule_drain.h"
+#include "capsule_retained.h"
+static int s_capture_context(const MoonTestContext *context,void *user,const char **reason) {
     TSState *state=user;(void)reason;
+    state->capsule_failure=state->capsule_stop=state->capsule_full_done=0;state->capsule_retry_ms=0;
     state->stage=0;state->action_ms=0;state->frame=context->frame;state->thread=GetCurrentThreadId();
     state->world=dhold(context->world);state->walker=dhold(context->walker);
     int ok=1;state->player=dhold(call(s_player,0,0,&ok));
     if(!state->world||!state->walker||!state->player||!ok)return MF_FAIL;
-    state->original_money=s_money(state,&ok);
+    return MF_PENDING;
+}
+static int s_capture(const MoonTestContext *context,void *user,const char **reason) {
+    int captured=s_capture_context(context,user,reason);
+    if(captured!=MF_PENDING)return captured;
+    TSState *state=user;int ok=1;state->original_money=s_money(state,&ok);
     return ok?MF_PENDING:MF_FAIL;
+}
+static void s_drop_borrowed(TSState *state) {
+    DRoot *roots[]={&state->save.task,&state->scene_camera,&state->scene_target,&state->scene_transform,&state->scene_first,&state->scene_last,
+        &state->scene_previous,&state->scene_atlas,&state->scene_model,&state->map,&state->camera,&state->native_inventory,
+        &state->native_container_id,&state->nodes,&state->gear,&state->tools,&state->previous_tool,&state->previous_prototype,
+        &state->menu,&state->player,&state->walker,&state->world};
+    for(unsigned i=0;i<sizeof(roots)/sizeof(roots[0]);i++)ddrop(roots[i]);
 }
 static int s_cleanup(const MoonTestContext *context,void *user) {
     TSState *state=user;(void)context;int ok=1;
-    if(state->key_held){s_key_event('Z',0,2,0);state->key_held=0;}
-    if(state->owns_slot) {
-        if(!s_restore_slot(state)){ok=0;s_note("cleanup","assignment-failed");}
-        PTR belt=s_get_component(dget(state->walker),"MoonToolbelt",&ok);
-        if(belt) {
-            if(state->original_belt_slot<0){void *args[]={dget(state->previous_prototype)};call(s_equip_prototype,belt,args,&ok);}
-            else {void *args[]={&state->original_belt_slot};call(s_select,belt,args,&ok);}
-        }else ok=0;
+    s_key_up(state);
+    if(state->capsule_stop||state->capsule.uncertain){
+        s_note("cleanup","capsule-controller-quarantined");cf_drop(&state->capsule);s_drop_borrowed(state);return 0;
     }
+    if(!cf_cleanup(&state->capsule,context?context->world:0)){
+        /* Equipment restoration invokes native Pin/Switch. After uncertain mass
+         * progress, do not make another world mutation merely to tidy the UI. */
+        s_note("cleanup","capsule-fixture-restore-failed");s_drop_borrowed(state);return 0;
+    }
+    if(state->owns_slot&&!s_restore_equipment(state)){
+        state->capsule_stop=1;state->capsule.uncertain=1;
+        s_note("cleanup","equipment-restore-failed");s_drop_borrowed(state);return 0;
+    }
+    if(!sc_cleanup(state))ok=0;
+    if(state->owns_map&&s_live(dget(state->map))) {
+        int opened=boolean(s_map_is_open,dget(state->map),&ok);
+        if(opened&&!state->map_was_open)call(s_map_close,dget(state->map),0,&ok);
+        if(boolean(s_map_is_open,dget(state->map),&ok)!=state->map_was_open)ok=0;
+    }
+    ddrop(&state->map);state->owns_map=state->map_was_open=0;
     if(state->menu&&!state->menu_was_open&&s_live(dget(state->menu))) {
         unsigned char no=0;void *args[]={&no};call(s_shop_open,dget(state->menu),args,&ok);
     }
@@ -149,10 +226,13 @@ static int s_cleanup(const MoonTestContext *context,void *user) {
         float restored=dnumber(s_fov,dget(state->camera),&ok);
         if(restored<state->original_fov-.01f||restored>state->original_fov+.01f)ok=0;
     }
-    ddrop(&state->camera);
-    ddrop(&state->nodes);ddrop(&state->gear);ddrop(&state->tools);
-    ddrop(&state->previous_tool);ddrop(&state->previous_prototype);ddrop(&state->menu);ddrop(&state->player);
-    ddrop(&state->walker);ddrop(&state->world);
+    if(state->camera_token) {
+        if(!ok||!s_camera_api||!s_camera_api->release(s_camera_owner,state->camera_token)){
+            s_note("cleanup","camera-lease-release-failed");return 0;
+        }
+        state->camera_token=0;
+    }
+    s_drop_borrowed(state);
     state->owns_slot=state->owns_wallet=state->menu_was_open=state->stage=0;
     return ok;
 }
@@ -186,12 +266,7 @@ static int s_wallet_step(const MoonTestContext *context,void *user,const char **
 static int s_catalog_step(const MoonTestContext *context,void *user,const char **reason) {
     TSState *state=user;(void)reason;int ok=1;
     if(!state->menu) {
-        PTR menu=s_get_component(context->walker,"MoonUpgradeShop",&ok);
-        if(!menu&&ok) {
-            PTR camera=0;PTR field=get_field(object_class(context->walker),"viewCamera");
-            if(field)field_value(context->walker,field,&camera);
-            void *args[]={camera};if(camera)menu=call(s_shop_camera,0,args,&ok);
-        }
+        PTR menu=s_native_shop(context,&ok);
         if(!ok||!s_live(menu))return MF_FAIL;
         state->menu=dhold(menu);state->menu_was_open=boolean(s_shop_is_open,menu,&ok);
         if(!ok)return MF_FAIL;
@@ -297,8 +372,20 @@ static int s_tool_step(const MoonTestContext *context,void *user,const char **re
     return ts->check("native-slot-equipped",equipped==1,equipped,1)?MF_PASS:MF_FAIL;
 }
 #include "zoom.h"
+#include "zoom_lifecycle.h"
+#include "map.h"
+#include "sticker.h"
+#include "pulse.h"
+#include "sticker_capacity.h"
 #include "progression.h"
+#include "vacuum.h"
+#include "vacuum_capsule.h"
+#include "vacuum_collect.h"
+#include "save_task.h"
+#include "vacuum_reload.h"
 #define TS_CASE(id,timeout,callback,user) {MF_ABI,sizeof(MoonTestCase),"test-scenarios." id,"test-scenarios",timeout,MF_READY|MF_HOST|MF_FOCUSED,s_capture,callback,s_cleanup,user}
+#define TS_EXPLICIT_CASE(id,timeout,callback,cleanup,user) {MF_ABI,sizeof(MoonTestCase),"test-scenarios." id,"test-scenarios",timeout,MF_READY|MF_HOST|MF_FOCUSED,s_capture,callback,cleanup,user}
+#define TS_READONLY_CASE(id,timeout,callback,cleanup,user) {MF_ABI,sizeof(MoonTestCase),"test-scenarios." id,"test-scenarios",timeout,MF_READY|MF_HOST|MF_FOCUSED,s_capture_context,callback,cleanup,user}
 static const MoonTestCase s_cases[]={
     TS_CASE("native-context",5000,s_context,&context_state),
     TS_CASE("native-wallet",5000,s_wallet_step,&wallet_state),
@@ -306,6 +393,7 @@ static const MoonTestCase s_cases[]={
     TS_CASE("zoom-module",10000,s_tool_step,&tool_states[0]),
     TS_CASE("sticker-label-gun",10000,s_tool_step,&tool_states[1]),
     TS_CASE("handheld-vacuum",10000,s_tool_step,&tool_states[2]),
+    TS_CASE("vacuum-full",30000,s_vacuum_collect_step,&vacuum_full_state),
     TS_CASE("flag-finder",10000,s_tool_step,&tool_states[3]),
     TS_CASE("portable-map",10000,s_tool_step,&tool_states[4]),
     TS_CASE("compass-cardinals",10000,s_tool_step,&tool_states[5]),
@@ -316,15 +404,30 @@ static const MoonTestCase s_cases[]={
     TS_CASE("building-drone-locked",5000,s_locked_step,&locked_states[0]),
     TS_CASE("joonas-backpack-locked",5000,s_locked_step,&locked_states[1]),
     TS_CASE("zoom-optics",20000,s_zoom_step,&zoom_state),
+    TS_CASE("zoom-menu-interruption",20000,s_zoom_interruption_step,&zoom_menu_state),
+    TS_CASE("zoom-unequip",20000,s_zoom_interruption_step,&zoom_unequip_state),
+    TS_CASE("zoom-camera-contention",20000,s_zoom_camera_step,&zoom_camera_state),
     TS_CASE("prepare-late-game",30000,s_progression_step,&progression_state),
+    TS_CASE("portable-map-toggle",20000,s_map_step,&map_state),
+    TS_CASE("sticker-effects",30000,s_sticker_step,&sticker_state),
+    TS_CASE("sticker-capacity",120000,s_sticker_capacity_step,&sticker_capacity_state),
+    TS_CASE("vacuum-container",15000,s_vacuum_container_step,&vacuum_container_state),
+    TS_CASE("vacuum-capsule-fixture",15000,s_vacuum_capsule_fixture_step,&vacuum_capsule_state),
+    TS_CASE("vacuum-collect",30000,s_vacuum_collect_step,&vacuum_collect_state),
+    TS_EXPLICIT_CASE("vacuum-save-prepare",30000,s_vacuum_checkpoint_step,s_vacuum_checkpoint_cleanup,&vacuum_checkpoint_state),
+    TS_READONLY_CASE("vacuum-save-reopen",15000,s_vacuum_reopen_step,s_vacuum_reopen_cleanup,&vacuum_reopen_state),
 };
 #undef TS_CASE
+#undef TS_EXPLICIT_CASE
+#undef TS_READONLY_CASE
 __declspec(dllexport) int MoonLab_ModStart(PTR domain,PTR game) {
     (void)prepare_hook;(void)install_hooks;(void)integer;(void)cat;(void)num;
     if(!bind_runtime(domain,game)||!dapi(game))return 0;
     s_string_length=(int(*)(PTR))GetProcAddress(game,"il2cpp_string_length");
     s_string_chars=(const unsigned short *(*)(PTR))GetProcAddress(game,"il2cpp_string_chars");
     if(!s_string_length||!s_string_chars)return 0;
+    (void)sc_bind(game);
+    (void)cf_bind(game);
     char folder[1000],path[1100];DWORD length=GetEnvironmentVariableA("MOONLAB_EVIDENCE",folder,sizeof(folder));
     if(length&&length<sizeof(folder)){
         cat(cat(path,folder),"\\test-scenarios.jsonl");s_log=CreateFileA(path,0x40000000,1,0,1,0x80,0);
@@ -336,6 +439,11 @@ __declspec(dllexport) int MoonLab_ModStart(PTR domain,PTR game) {
     shop=runtime->find("shop-framework","shop",MS_ABI,sizeof(MoonShop));
     equipment=runtime->find("equipment-framework","equipment",ME_ABI,sizeof(MoonEquipment));
     if(!ts||!isolation||!shop||!equipment)return 0;
+    PTR loader=GetModuleHandleA("version.dll");
+    MoonGetCameraApiV1 camera_getter=loader?(MoonGetCameraApiV1)GetProcAddress(loader,"MoonLab_GetCameraApi_v1"):0;
+    s_camera_api=camera_getter?camera_getter(MOON_CAMERA_ABI,sizeof(MoonCameraApiV1)):0;
+    if(!moon_camera_api_valid(s_camera_api))s_camera_api=0;
+
 #define S_BIND(to,ns,type,name,signature) to=dmethod(ns,type,name,signature);if(!to)return 0;
     S_BIND(s_alive,"UnityEngine","Object","op_Implicit","UnityEngine.Object");
     S_BIND(s_player,"MoonCleaners","MoonCrew","get_LocalPlayerId","");
@@ -359,6 +467,8 @@ __declspec(dllexport) int MoonLab_ModStart(PTR domain,PTR game) {
     S_BIND(s_firstperson,"MoonCleaners","MoonWalker","get_IsFirstPerson","");
     S_BIND(s_menu_blocked,"MoonCleaners","MoonWalker","get_MenuBlocked","");
     S_BIND(s_typing,"MoonCleaners","MoonInput","get_Typing","");
+    S_BIND(s_map_is_open,"MoonCleaners","MoonMapScreen","get_IsOpen","");
+    S_BIND(s_map_close,"MoonCleaners","MoonMapScreen","Close","");
     S_BIND(s_tree_level,"MoonCleaners","MoonWorld","TreeLevel","System.String;System.String");
     S_BIND(s_tree_max,"MoonCleaners","MoonWorld","TreeMaxLevel","MoonCleaners.MoonUpgradeTree.Node");
     S_BIND(s_tree_requirements,"MoonCleaners","MoonWorld","TreeRequirementsMet","System.String;MoonCleaners.MoonUpgradeTree.Node");
@@ -373,7 +483,6 @@ __declspec(dllexport) int MoonLab_ModStart(PTR domain,PTR game) {
     S_BIND(s_sends_achievements,"MoonCleaners","MoonAchievements","get_SendsToSteam","");
 #undef S_BIND
     if(method_token(s_tree_buy)!=100665707||method_token(s_tool_buy)!=100665742)return 0;
-    s_class_init=(void(*)(PTR))GetProcAddress(game,"il2cpp_runtime_class_init");
     s_static_get=(void(*)(PTR,void *))GetProcAddress(game,"il2cpp_field_static_get_value");
     const char *achievement_methods[]={"get_SendsToSteam","Flush","SyncWithSteam","Unlock","Add","Raise","OnMoney","OnPurchase"};
     const unsigned achievement_arities[]={0,0,0,1,2,2,2,3};
